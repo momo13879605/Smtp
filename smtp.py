@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import zipfile
+import random
+import re
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid, formataddr
 from io import BytesIO
@@ -10,26 +12,31 @@ import time
 import smtplib
 import socket
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
     ContextTypes,
+    ConversationHandler,
 )
 from telegram.constants import ParseMode
 
 # ==================== تنظیمات ====================
 BOT_TOKEN = "7413084969:AAHglr2N6eO_9VxhGCepns0iWKr9nYgmDZg"                 # ← توکن ربات از @BotFather
 ADMIN_ID = 5914346958                        # ← آیدی عددی شما
-TEST_RECIPIENT = "source.donii@gmail.com"       # ← ایمیل مقصد تست
+DEFAULT_TEST_RECIPIENT = "cowacik720@ocuser.com"  # ایمیل مقصد پیش‌فرض
 
 TIMEOUT_SMTP = 8                            # تایم‌اوت هر تست (ثانیه)
 MAX_CONCURRENT_TASKS = 10                   # تعداد تست هم‌زمان
 DELAY_BETWEEN_TASKS = 0.2                   # تأخیر بین شروع تسک‌ها (کنترل نرخ ورود)
 PER_DOMAIN_DELAY = 2.0                      # حداقل فاصله (ثانیه) بین تست‌های یک دامنه
-SMTP_DEBUG_LEVEL = 0                        # 0 = خاموش, 1 = نمایش دستورات SMTP در لاگ سرور
+SMTP_DEBUG_LEVEL = 0                        # 0 = خاموش, 1 = نمایش دستورات SMTP
+
+MAX_RETRIES = 3                             # حداکثر تلاش برای خطاهای گذرا
+RETRY_BACKOFF_BASE = 2.0                    # ضریب تأخیر تصاعدی
+RETRY_JITTER = 0.5                          # جیتر تصادفی
 # =================================================
 
 logging.basicConfig(
@@ -37,6 +44,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ذخیره‌سازی ایمیل مقصد برای هر کاربر (فقط ادمین)
+user_target_email: Dict[int, str] = {}
 
 # کنترل نرخ دامنه
 domain_last_test: Dict[str, float] = {}
@@ -46,11 +56,13 @@ domain_lock = asyncio.Lock()
 user_active_tasks: dict[int, asyncio.Event] = {}
 user_task_list: dict[int, list[asyncio.Task]] = {}
 
+# مراحل ConversationHandler برای تغییر ایمیل
+WAITING_FOR_EMAIL = 1
+
 
 # ==================== توابع کمکی ====================
 
 def parse_smtp_list(file_content: str) -> List[Tuple[str, int, str, str]]:
-    """تجزیه فایل SMTP با جداکننده‌های | : ,"""
     tokens = file_content.split()
     entries = []
     for token in tokens:
@@ -67,77 +79,94 @@ def parse_smtp_list(file_content: str) -> List[Tuple[str, int, str, str]]:
     return entries
 
 
+def is_transient_error(error_msg: str) -> bool:
+    transient_keywords = [
+        'timeout', 'timed out', 'connection reset', 'connection refused',
+        'too many concurrent', 'dns', 'name or service not known',
+        'connection unexpectedly closed', 'response took too long',
+        'no response from server', 'overall timeout',
+        'the read operation timed out', 'try again later'
+    ]
+    return any(keyword in error_msg.lower() for keyword in transient_keywords)
+
+
 def test_and_send_smtp(host: str, port: int, user: str, password: str,
                        recipient: str) -> Tuple[bool, str]:
     """
-    تلاش برای لاگین و ارسال ایمیل تست.
-    بازگشتی: (موفقیت, پیام خطا یا 'ارسال موفق')
-    پیام خطا شامل دلیل دقیق شکست است.
+    تلاش برای لاگین و ارسال ایمیل تست با تلاش مجدد برای خطاهای گذرا.
     """
-    server = None
-    try:
-        # اتصال به سرور
-        if port == 465:
-            server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT_SMTP)
-        else:
-            server = smtplib.SMTP(host, port, timeout=TIMEOUT_SMTP)
-            server.ehlo()
-            if server.has_extn('STARTTLS'):
-                server.starttls()
+    last_error = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        server = None
+        try:
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT_SMTP)
+            else:
+                server = smtplib.SMTP(host, port, timeout=TIMEOUT_SMTP)
                 server.ehlo()
+                if server.has_extn('STARTTLS'):
+                    server.starttls()
+                    server.ehlo()
 
-        if SMTP_DEBUG_LEVEL > 0:
-            server.set_debuglevel(SMTP_DEBUG_LEVEL)
+            if SMTP_DEBUG_LEVEL > 0:
+                server.set_debuglevel(SMTP_DEBUG_LEVEL)
 
-        # احراز هویت
-        server.login(user, password)
+            server.login(user, password)
 
-        # ساخت ایمیل با MIMEText استاندارد
-        msg = MIMEText(
-            "This is a delivery test. If you receive this, the SMTP is healthy.",
-            'plain',
-            'utf-8'
-        )
-        msg['Subject'] = "SMTP Delivery Test"
-        msg['From'] = formataddr((None, user))
-        msg['To'] = recipient
-        msg['Date'] = formatdate(localtime=True)
-        msg['Message-ID'] = make_msgid(domain=host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else "smtp.test")
+            msg = MIMEText(
+                "This is a delivery test. If you receive this, the SMTP is healthy.",
+                'plain', 'utf-8'
+            )
+            msg['Subject'] = "SMTP Delivery Test"
+            msg['From'] = formataddr((None, user))
+            msg['To'] = recipient
+            msg['Date'] = formatdate(localtime=True)
+            msg['Message-ID'] = make_msgid(domain=host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else "smtp.test")
 
-        # ارسال ایمیل – اگر خطایی رخ ندهد، یعنی واقعاً تحویل سرور داده شده
-        server.sendmail(user, recipient, msg.as_string())
-        return True, "ارسال موفق"
+            server.sendmail(user, recipient, msg.as_string())
+            return True, "ارسال موفق"
 
-    except smtplib.SMTPAuthenticationError as e:
-        return False, f"Authentication failed: {e.smtp_code} {e.smtp_error}"
-    except smtplib.SMTPRecipientsRefused as e:
-        return False, f"Recipient refused: {e.recipients}"
-    except smtplib.SMTPSenderRefused as e:
-        return False, f"Sender refused: {e.smtp_code} {e.smtp_error}"
-    except smtplib.SMTPDataError as e:
-        return False, f"Data error: {e.smtp_code} {e.smtp_error}"
-    except smtplib.SMTPConnectError as e:
-        return False, f"Connection error: {e.smtp_code} {e.smtp_error}"
-    except smtplib.SMTPHeloError as e:
-        return False, f"HELO/EHLO error: {e.smtp_code} {e.smtp_error}"
-    except smtplib.SMTPNotSupportedError as e:
-        return False, f"Feature not supported: {e}"
-    except smtplib.SMTPException as e:
-        return False, f"General SMTP error: {e}"
-    except socket.timeout:
-        return False, "Connection timeout (no response from server)"
-    except socket.gaierror as e:
-        return False, f"DNS/Address error: {e}"
-    except ConnectionRefusedError:
-        return False, "Connection refused by server"
-    except Exception as e:
-        return False, f"Unknown error: {e}"
-    finally:
-        if server:
-            try:
-                server.quit()
-            except:
-                pass
+        except smtplib.SMTPAuthenticationError as e:
+            return False, f"Authentication failed: {e.smtp_code} {e.smtp_error}"
+        except smtplib.SMTPRecipientsRefused as e:
+            return False, f"Recipient refused: {e.recipients}"
+        except smtplib.SMTPSenderRefused as e:
+            return False, f"Sender refused: {e.smtp_code} {e.smtp_error}"
+        except smtplib.SMTPDataError as e:
+            return False, f"Data error: {e.smtp_code} {e.smtp_error}"
+        except smtplib.SMTPHeloError as e:
+            return False, f"HELO/EHLO error: {e.smtp_code} {e.smtp_error}"
+        except smtplib.SMTPNotSupportedError as e:
+            return False, f"Feature not supported: {e}"
+        except smtplib.SMTPConnectError as e:
+            last_error = f"Connection error: {e.smtp_code} {e.smtp_error}"
+        except smtplib.SMTPException as e:
+            last_error = f"General SMTP error: {e}"
+        except socket.timeout:
+            last_error = "Connection timeout (no response from server)"
+        except socket.gaierror as e:
+            last_error = f"DNS/Address error: {e}"
+        except ConnectionRefusedError:
+            last_error = "Connection refused by server"
+        except asyncio.TimeoutError:
+            last_error = "Overall timeout (response took too long)"
+        except Exception as e:
+            last_error = f"Unknown error: {e}"
+        finally:
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
+
+        if attempt < MAX_RETRIES and is_transient_error(last_error):
+            wait = RETRY_BACKOFF_BASE ** attempt + random.uniform(0, RETRY_JITTER)
+            logger.info(f"Retry {attempt+1}/{MAX_RETRIES} for {host}:{port} after {wait:.1f}s")
+            time.sleep(wait)
+        else:
+            break
+
+    return False, last_error
 
 
 def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
@@ -150,7 +179,6 @@ def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
 
 
 async def wait_for_domain(host: str):
-    """کنترل نرخ تست برای یک دامنه خاص"""
     domain = host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else host
     async with domain_lock:
         now = time.time()
@@ -162,20 +190,38 @@ async def wait_for_domain(host: str):
         domain_last_test[domain] = time.time()
 
 
+def get_target_email(user_id: int) -> str:
+    """دریافت ایمیل مقصد برای یک کاربر خاص"""
+    return user_target_email.get(user_id, DEFAULT_TEST_RECIPIENT)
+
+
+# ==================== کیبورد دکمه‌ای ====================
+
+CHANGE_EMAIL_BUTTON = "📧 تغییر ایمیل مقصد"
+
+admin_keyboard = ReplyKeyboardMarkup(
+    [[CHANGE_EMAIL_BUTTON]], resize_keyboard=True, one_time_keyboard=False
+)
+
+
 # ==================== هندلرهای ربات ====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ شما دسترسی ندارید.")
         return
+
+    target = get_target_email(ADMIN_ID)
     await update.message.reply_text(
-        "🤖 **ربات تست SMTP (ارسال واقعی، لاگ کامل خطاها)**\n\n"
-        "لطفاً فایل txt حاوی SMTP ها را ارسال کنید.\n"
+        f"🤖 **ربات تست SMTP**\n\n"
+        f"📧 ایمیل مقصد فعلی: `{target}`\n"
+        f"برای تغییر آن از دکمه‌ی زیر استفاده کنید.\n\n"
+        f"لطفاً فایل txt حاوی SMTP ها را ارسال کنید.\n"
         f"تنظیمات: هم‌زمان={MAX_CONCURRENT_TASKS}, تایم‌اوت={TIMEOUT_SMTP}s\n"
-        f"ایمیل تست: `{TEST_RECIPIENT}`\n"
-        "پس از پایان، فایل سالم‌ها + فایل دلایل شکست ارسال می‌شود.\n"
-        "/cancel برای توقف",
-        parse_mode=ParseMode.MARKDOWN
+        f"🔄 حداکثر تلاش مجدد برای خطاهای گذرا: {MAX_RETRIES}\n"
+        f"/cancel برای توقف تست",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_keyboard
     )
 
 
@@ -191,10 +237,70 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for task in user_task_list.get(chat_id, []):
             task.cancel()
         user_task_list.pop(chat_id, None)
-        await update.message.reply_text("🛑 فرایند تست کنسل شد. همه وظایف متوقف می‌شوند.")
+        await update.message.reply_text("🛑 فرایند تست کنسل شد.")
     else:
         await update.message.reply_text("ℹ️ هیچ تستی در حال اجرا نیست.")
 
+
+# ---------- تغییر ایمیل مقصد (دو مرحله) ----------
+
+async def change_email_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فعال شدن دکمه تغییر ایمیل"""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📧 لطفاً ایمیل جدید را وارد کنید:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return WAITING_FOR_EMAIL
+
+
+async def change_email_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت ایمیل جدید و ذخیره آن"""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return ConversationHandler.END
+
+    new_email = update.message.text.strip()
+    # اعتبارسنجی ساده ایمیل
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", new_email):
+        await update.message.reply_text(
+            "❌ فرمت ایمیل نادرست است. لطفاً دوباره تلاش کنید.",
+            reply_markup=admin_keyboard
+        )
+        return ConversationHandler.END
+
+    user_target_email[user_id] = new_email
+    await update.message.reply_text(
+        f"✅ ایمیل مقصد با موفقیت به `{new_email}` تغییر یافت.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_keyboard
+    )
+    return ConversationHandler.END
+
+
+async def change_email_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """انصراف از تغییر ایمیل"""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "❌ عملیات تغییر ایمیل لغو شد.",
+        reply_markup=admin_keyboard
+    )
+    return ConversationHandler.END
+
+
+change_email_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex(f"^{CHANGE_EMAIL_BUTTON}$") & filters.Chat(ADMIN_ID), change_email_start)],
+    states={
+        WAITING_FOR_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_email_received)]
+    },
+    fallbacks=[CommandHandler("cancel", change_email_cancel)],
+)
+
+
+# ---------- دریافت فایل و شروع تست ----------
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -228,15 +334,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ هیچ رکورد SMTP معتبری در فایل پیدا نشد.")
         return
 
+    target_email = get_target_email(user_id)
+
     status_msg = await update.message.reply_text(
         f"📥 فایل دریافت شد.\n"
         f"🔢 تعداد SMTP: {total}\n"
+        f"📧 ایمیل مقصد: `{target_email}`\n"
         f"⚙️ هم‌زمان={MAX_CONCURRENT_TASKS}, تایم‌اوت={TIMEOUT_SMTP}s\n"
+        f"🔄 تلاش مجدد: {MAX_RETRIES}\n"
         f"⏳ تست‌ها شروع می‌شوند...\n"
-        f"/cancel برای توقف"
+        f"/cancel برای توقف",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=admin_keyboard
     )
 
-    # پین پیام (بدون اعلان)
     try:
         await context.bot.pin_chat_message(chat_id=chat_id, message_id=status_msg.message_id, disable_notification=True)
     except Exception as e:
@@ -246,8 +357,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_active_tasks[chat_id] = cancel_event
     user_task_list[chat_id] = []
 
-    valid_smtps: List[str] = []          # ذخیره‌سازی به صورت host:port:user:pass
-    failed_log_lines: List[str] = []     # خطاهای کامل برای فایل لاگ
+    valid_smtps: List[str] = []
+    failed_log_lines: List[str] = []
     error_occurred = False
     error_message = ""
     completed = 0
@@ -268,17 +379,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_running_loop()
             try:
                 success, msg = await asyncio.wait_for(
-                    loop.run_in_executor(None, test_and_send_smtp, host, port, user, pwd, TEST_RECIPIENT),
-                    timeout=TIMEOUT_SMTP + 2
+                    loop.run_in_executor(None, test_and_send_smtp, host, port, user, pwd, target_email),
+                    timeout=TIMEOUT_SMTP * 2 + 10
                 )
             except asyncio.TimeoutError:
-                success, msg = False, "Overall timeout (response took too long)"
+                success, msg = False, "Overall timeout after retries"
             except Exception as e:
                 success, msg = False, f"System error: {e}"
 
         if success:
             valid_smtps.append(f"{host}:{port}:{user}:{pwd}")
-            # ارسال پیام با فرمت درخواستی
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
@@ -293,7 +403,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"ارسال پیام سالم ناموفق: {e}")
         else:
-            # ثبت در لاگ شکست با جزئیات کامل
             fail_line = f"{host}:{port}:{user}:{pwd} | Reason: {msg}"
             failed_log_lines.append(fail_line)
 
@@ -305,7 +414,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⏳ پیشرفت: {completed}/{total}\n"
                     f"✅ سالم: {len(valid_smtps)}\n"
                     f"❌ ناموفق: {len(failed_log_lines)}\n"
-                    f"/cancel برای توقف"
+                    f"/cancel برای توقف",
+                    parse_mode=ParseMode.MARKDOWN
                 )
             except:
                 pass
@@ -335,13 +445,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id in user_task_list:
             del user_task_list[chat_id]
 
-        # برداشتن پین
         try:
             await context.bot.unpin_chat_message(chat_id=chat_id, message_id=status_msg.message_id)
         except:
             pass
 
-        # ساخت فایل‌های نهایی
         files_to_send = []
 
         if valid_smtps:
@@ -367,7 +475,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             zip_file.name = "smtp_error_report.zip"
             files_to_send.append((zip_file, "⚠️ خطا در فرایند. گزارش کامل پیوست شد."))
 
-        # ارسال فایل‌ها به ادمین
         for file_obj, caption in files_to_send:
             try:
                 await context.bot.send_document(chat_id=ADMIN_ID, document=file_obj, caption=caption)
@@ -381,13 +488,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ ناموفق: {len(failed_log_lines)}"
         )
         await status_msg.edit_text(final_text)
+        # بازگرداندن کیبورد
+        await context.bot.send_message(chat_id=chat_id, text="می‌توانید فایل دیگری ارسال کنید.", reply_markup=admin_keyboard)
 
+
+# ==================== اجرای ربات ====================
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # هندلرها
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(change_email_conv)  # ConversationHandler تغییر ایمیل
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
     logger.info("ربات شروع به کار کرد...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
