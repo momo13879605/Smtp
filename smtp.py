@@ -2,8 +2,7 @@ import asyncio
 import logging
 import zipfile
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, formataddr
 from io import BytesIO
 from typing import List, Tuple, Dict
 import time
@@ -25,10 +24,12 @@ from telegram.constants import ParseMode
 BOT_TOKEN = "7413084969:AAHglr2N6eO_9VxhGCepns0iWKr9nYgmDZg"                 # ← توکن ربات از @BotFather
 ADMIN_ID = 5914346958                        # ← آیدی عددی شما
 TEST_RECIPIENT = "source.donii@gmail.com"       # ← ایمیل مقصد تست
+
 TIMEOUT_SMTP = 8                            # تایم‌اوت هر تست (ثانیه)
 MAX_CONCURRENT_TASKS = 10                   # تعداد تست هم‌زمان
 DELAY_BETWEEN_TASKS = 0.2                   # تأخیر بین شروع تسک‌ها (کنترل نرخ ورود)
 PER_DOMAIN_DELAY = 2.0                      # حداقل فاصله (ثانیه) بین تست‌های یک دامنه
+SMTP_DEBUG_LEVEL = 0                        # 0 = خاموش, 1 = نمایش دستورات SMTP در لاگ سرور
 # =================================================
 
 logging.basicConfig(
@@ -69,11 +70,13 @@ def parse_smtp_list(file_content: str) -> List[Tuple[str, int, str, str]]:
 def test_and_send_smtp(host: str, port: int, user: str, password: str,
                        recipient: str) -> Tuple[bool, str]:
     """
-    تلاش برای لاگین و ارسال ایمیل تست با هدرهای کامل.
-    برمی‌گرداند: (موفقیت, پیام خطا یا موفقیت)
+    تلاش برای لاگین و ارسال ایمیل تست.
+    بازگشتی: (موفقیت, پیام خطا یا 'ارسال موفق')
+    پیام خطا شامل دلیل دقیق شکست است.
     """
+    server = None
     try:
-        # اتصال
+        # اتصال به سرور
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT_SMTP)
         else:
@@ -83,50 +86,58 @@ def test_and_send_smtp(host: str, port: int, user: str, password: str,
                 server.starttls()
                 server.ehlo()
 
-        # لاگین
+        if SMTP_DEBUG_LEVEL > 0:
+            server.set_debuglevel(SMTP_DEBUG_LEVEL)
+
+        # احراز هویت
         server.login(user, password)
 
-        # ساخت ایمیل تست کامل (با هدرهای Date و Message-ID)
-        msg = MIMEMultipart()
-        msg['From'] = user
-        msg['To'] = recipient
-        msg['Subject'] = "SMTP Delivery Test"
-        msg['Date'] = formatdate(localtime=True)        # ← این هدر حیاتی است
-        msg['Message-ID'] = make_msgid(domain=host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else "smtp.test")
-        msg.attach(MIMEText(
+        # ساخت ایمیل با MIMEText استاندارد
+        msg = MIMEText(
             "This is a delivery test. If you receive this, the SMTP is healthy.",
-            'plain'
-        ))
+            'plain',
+            'utf-8'
+        )
+        msg['Subject'] = "SMTP Delivery Test"
+        msg['From'] = formataddr((None, user))
+        msg['To'] = recipient
+        msg['Date'] = formatdate(localtime=True)
+        msg['Message-ID'] = make_msgid(domain=host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else "smtp.test")
 
-        # ارسال
+        # ارسال ایمیل – اگر خطایی رخ ندهد، یعنی واقعاً تحویل سرور داده شده
         server.sendmail(user, recipient, msg.as_string())
-        server.quit()
         return True, "ارسال موفق"
 
     except smtplib.SMTPAuthenticationError as e:
-        return False, f"خطای احراز هویت: {e.smtp_code} {e.smtp_error}"
+        return False, f"Authentication failed: {e.smtp_code} {e.smtp_error}"
     except smtplib.SMTPRecipientsRefused as e:
-        return False, f"گیرنده رد شد: {e.recipients}"
+        return False, f"Recipient refused: {e.recipients}"
     except smtplib.SMTPSenderRefused as e:
-        return False, f"فرستنده رد شد: {e.smtp_code} {e.smtp_error}"
+        return False, f"Sender refused: {e.smtp_code} {e.smtp_error}"
     except smtplib.SMTPDataError as e:
-        return False, f"خطای داده (Data Error): {e.smtp_code} {e.smtp_error}"
+        return False, f"Data error: {e.smtp_code} {e.smtp_error}"
     except smtplib.SMTPConnectError as e:
-        return False, f"خطای اتصال: {e.smtp_code} {e.smtp_error}"
+        return False, f"Connection error: {e.smtp_code} {e.smtp_error}"
     except smtplib.SMTPHeloError as e:
-        return False, f"خطای HELO/EHLO: {e.smtp_code} {e.smtp_error}"
+        return False, f"HELO/EHLO error: {e.smtp_code} {e.smtp_error}"
     except smtplib.SMTPNotSupportedError as e:
-        return False, f"ویژگی پشتیبانی نمی‌شود: {e}"
+        return False, f"Feature not supported: {e}"
     except smtplib.SMTPException as e:
-        return False, f"خطای عمومی SMTP: {e}"
+        return False, f"General SMTP error: {e}"
     except socket.timeout:
-        return False, "اتصال تایم‌اوت شد (پاسخی از سرور دریافت نشد)"
+        return False, "Connection timeout (no response from server)"
     except socket.gaierror as e:
-        return False, f"خطای DNS/آدرس: {e}"
+        return False, f"DNS/Address error: {e}"
     except ConnectionRefusedError:
-        return False, "اتصال توسط سرور رد شد (Connection Refused)"
+        return False, "Connection refused by server"
     except Exception as e:
-        return False, f"خطای ناشناخته: {e}"
+        return False, f"Unknown error: {e}"
+    finally:
+        if server:
+            try:
+                server.quit()
+            except:
+                pass
 
 
 def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
@@ -139,7 +150,7 @@ def create_zip_in_memory(files: dict[str, str]) -> BytesIO:
 
 
 async def wait_for_domain(host: str):
-    """کنترل نرخ برای یک دامنه خاص"""
+    """کنترل نرخ تست برای یک دامنه خاص"""
     domain = host.split('.')[-2] + '.' + host.split('.')[-1] if '.' in host else host
     async with domain_lock:
         now = time.time()
@@ -158,11 +169,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ شما دسترسی ندارید.")
         return
     await update.message.reply_text(
-        "🤖 **ربات تست SMTP (ارسال واقعی با هدرهای استاندارد)**\n\n"
+        "🤖 **ربات تست SMTP (ارسال واقعی، لاگ کامل خطاها)**\n\n"
         "لطفاً فایل txt حاوی SMTP ها را ارسال کنید.\n"
         f"تنظیمات: هم‌زمان={MAX_CONCURRENT_TASKS}, تایم‌اوت={TIMEOUT_SMTP}s\n"
         f"ایمیل تست: `{TEST_RECIPIENT}`\n"
-        "پس از پایان، فایل سالم‌ها + فایل خطاهای دقیق ارسال می‌شود.\n"
+        "پس از پایان، فایل سالم‌ها + فایل دلایل شکست ارسال می‌شود.\n"
         "/cancel برای توقف",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -235,8 +246,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_active_tasks[chat_id] = cancel_event
     user_task_list[chat_id] = []
 
-    valid_smtps: List[str] = []          # host:port:user:pass
-    failed_details: List[str] = []       # خطاهای دقیق
+    valid_smtps: List[str] = []          # ذخیره‌سازی به صورت host:port:user:pass
+    failed_log_lines: List[str] = []     # خطاهای کامل برای فایل لاگ
     error_occurred = False
     error_message = ""
     completed = 0
@@ -244,7 +255,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
     async def worker(host: str, port: int, user: str, pwd: str):
-        nonlocal completed, valid_smtps, failed_details
+        nonlocal completed, valid_smtps, failed_log_lines
         if cancel_event.is_set():
             return
 
@@ -261,27 +272,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     timeout=TIMEOUT_SMTP + 2
                 )
             except asyncio.TimeoutError:
-                success, msg = False, "تایم‌اوت کلی (پاسخ دیرتر از حد انتظار)"
+                success, msg = False, "Overall timeout (response took too long)"
             except Exception as e:
-                success, msg = False, f"خطای سیستمی: {e}"
+                success, msg = False, f"System error: {e}"
 
         if success:
             valid_smtps.append(f"{host}:{port}:{user}:{pwd}")
+            # ارسال پیام با فرمت درخواستی
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
                     text=(
-                        f"✅ SMTP سالم: `{host}:{port}`\n"
-                        f"کاربر: `{user}`\n"
-                        f"رمز: `{pwd}`"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN
+                        f"✅ SMTP سالم پیدا شد:\n"
+                        f"هاست: {host}\n"
+                        f"پورت: {port}\n"
+                        f"کاربر: {user}\n"
+                        f"رمز: {pwd}"
+                    )
                 )
             except Exception as e:
                 logger.error(f"ارسال پیام سالم ناموفق: {e}")
         else:
-            fail_line = f"{host}:{port}:{user}:{pwd} | {msg}"
-            failed_details.append(fail_line)
+            # ثبت در لاگ شکست با جزئیات کامل
+            fail_line = f"{host}:{port}:{user}:{pwd} | Reason: {msg}"
+            failed_log_lines.append(fail_line)
 
         completed += 1
 
@@ -290,7 +304,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text(
                     f"⏳ پیشرفت: {completed}/{total}\n"
                     f"✅ سالم: {len(valid_smtps)}\n"
-                    f"❌ ناموفق: {len(failed_details)}\n"
+                    f"❌ ناموفق: {len(failed_log_lines)}\n"
                     f"/cancel برای توقف"
                 )
             except:
@@ -336,23 +350,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             valid_file.name = "valid_smtps.txt"
             files_to_send.append((valid_file, f"📁 {len(valid_smtps)} SMTP سالم (ارسال موفق)"))
 
-        if failed_details:
-            failed_content = "\n".join(failed_details)
+        if failed_log_lines:
+            failed_content = "\n".join(failed_log_lines)
             failed_file = BytesIO(failed_content.encode("utf-8"))
-            failed_file.name = "failed_smtps_with_reasons.txt"
-            files_to_send.append((failed_file, f"📁 {len(failed_details)} SMTP ناموفق با دلایل دقیق"))
+            failed_file.name = "failed_smtps_detailed.log"
+            files_to_send.append((failed_file, f"📁 {len(failed_log_lines)} SMTP ناموفق با دلایل دقیق"))
 
         if error_occurred:
             zip_files = {}
             if valid_smtps:
                 zip_files["valid_smtps_partial.txt"] = "\n".join(valid_smtps)
-            if failed_details:
-                zip_files["failed_details.txt"] = "\n".join(failed_details)
+            if failed_log_lines:
+                zip_files["failed_details.log"] = "\n".join(failed_log_lines)
             zip_files["error.txt"] = f"Error during testing:\n{error_message}"
             zip_file = create_zip_in_memory(zip_files)
             zip_file.name = "smtp_error_report.zip"
             files_to_send.append((zip_file, "⚠️ خطا در فرایند. گزارش کامل پیوست شد."))
 
+        # ارسال فایل‌ها به ادمین
         for file_obj, caption in files_to_send:
             try:
                 await context.bot.send_document(chat_id=ADMIN_ID, document=file_obj, caption=caption)
@@ -363,7 +378,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ تست‌ها به پایان رسید.\n"
             f"🔢 کل: {total}\n"
             f"💚 سالم: {len(valid_smtps)}\n"
-            f"❌ ناموفق: {len(failed_details)}"
+            f"❌ ناموفق: {len(failed_log_lines)}"
         )
         await status_msg.edit_text(final_text)
 
